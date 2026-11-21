@@ -1,22 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-import sys
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
+from time import perf_counter
 from typing import Literal
 
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from starlette.formparsers import MultiPartParser
 
 from app import __version__
-from app.logging_config import configure_logging
-from app.repositories.document_repository import close_document_repository
+from app.cache.document_cache import close_document_cache, get_document_cache
+from app.logging_config import bind_request_id, clear_request_id, configure_logging, get_request_id
+from app.repositories.document_repository import (
+    close_document_repository,
+    get_document_repository,
+)
+from app.resilience.errors import BulkheadFullError, CircuitBreakerOpenError
+from app.resilience.metrics import get_metrics
 from app.services.document_service import DocumentService, InvalidStatusTransitionError
 from app.services.extract_client import (
     ExtractServiceBusyError,
@@ -25,7 +33,13 @@ from app.services.extract_client import (
     InvalidPDFError,
     close_extract_client,
 )
-from app.services.upload_service import process_pdf_upload
+from app.services.extract_resilience import get_extract_breaker
+from app.services.saga_recovery import run_saga_recovery_loop
+from app.services.upload_service import (
+    DocumentNotFoundError,
+    DocumentProcessingInProgressError,
+    process_pdf_upload,
+)
 from app.settings import get_settings
 
 load_dotenv()
@@ -36,24 +50,87 @@ INVALID_CONTENT_TYPE_ERROR_DETAIL = "El archivo debe enviarse como application/p
 INVALID_DOCUMENT_ID_ERROR_DETAIL = "ID de documento inválido."
 NO_UPDATE_FIELDS_ERROR_DETAIL = "No hay campos para actualizar."
 SERVICE_BUSY_ERROR_DETAIL = "Servicio saturado, reintentá en unos segundos."
-MAX_LIST_LIMIT = 100
-
+DOCUMENT_IN_PROGRESS_ERROR_DETAIL = "El documento ya está siendo procesado, reintentá."
 
 settings = get_settings()
-configure_logging(settings.log_level)
+configure_logging(settings.log_level, settings.log_format)
 logger = logging.getLogger(__name__)
 logger.info("Settings loaded: %s", settings)
-MultiPartParser.spool_max_size = sys.maxsize
+MultiPartParser.spool_max_size = settings.upload_spool_max_bytes
+MAX_LIST_LIMIT = settings.max_list_limit
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    yield
-    close_extract_client()
-    close_document_repository()
+    stop_recovery = asyncio.Event()
+    recovery_task: asyncio.Task | None = None
+
+    # Migración de índises idempotente: la BD es propiedad de este servicio.
+    try:
+        await asyncio.to_thread(get_document_repository().ensure_indexes)
+    except Exception as exc:
+        logger.warning("No se pudieron asegurar los índices al arrancar: %s", exc)
+
+    recovery_task = asyncio.create_task(run_saga_recovery_loop(stop_recovery))
+
+    try:
+        yield
+    finally:
+        stop_recovery.set()
+        if recovery_task is not None:
+            try:
+                await asyncio.wait_for(recovery_task, timeout=settings.shutdown_timeout_s)
+            except TimeoutError:
+                recovery_task.cancel()
+                logger.warning("La tarea de recuperación de sagas no terminó a tiempo")
+        close_extract_client()
+        close_document_repository()
+        close_document_cache()
 
 
 app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
+
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    request_id = (
+        request.headers.get("x-request-id")
+        or request.headers.get("x-correlation-id")
+        or uuid.uuid4().hex
+    )
+    token = bind_request_id(request_id)
+    started_at = perf_counter()
+    response: Response | None = None
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "Unhandled request error",
+            extra={
+                "event": "http.error",
+                "method": request.method,
+                "path": request.url.path,
+                "duration_ms": int((perf_counter() - started_at) * 1000),
+            },
+        )
+        raise
+    finally:
+        logger.info(
+            "HTTP request completed",
+            extra={
+                "event": "http.access",
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code if response is not None else 500,
+                "duration_ms": int((perf_counter() - started_at) * 1000),
+            },
+        )
+        clear_request_id(token)
+
+    assert response is not None
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 class DocumentUpdate(BaseModel):
@@ -66,6 +143,42 @@ class DocumentUpdate(BaseModel):
 def health() -> dict[str, str]:
     logger.debug("Health check requested")
     return {"status": "ok"}
+
+
+@app.get("/health/live")
+def liveness() -> dict[str, str]:
+    return {"status": "ok", "request_id": get_request_id() or "-"}
+
+
+@app.get("/health/ready")
+def readiness() -> JSONResponse:
+    checks: dict[str, str] = {}
+    ready = True
+
+    try:
+        get_document_repository().client.admin.command("ping")
+        checks["mongodb"] = "ok"
+    except Exception as exc:
+        checks["mongodb"] = f"unavailable: {type(exc).__name__}"
+        ready = False
+
+    breaker_state = get_extract_breaker().state.value
+    checks["extract_breaker"] = breaker_state
+    if breaker_state == "open":
+        ready = False
+
+    # La caché es degradable: se reporta pero no bloquea el readiness.
+    checks["cache"] = "ok" if get_document_cache().ping() else "degraded"
+
+    return JSONResponse(
+        {"status": "ready" if ready else "unavailable", "checks": checks},
+        status_code=200 if ready else 503,
+    )
+
+
+@app.get("/metrics")
+def metrics() -> dict[str, float]:
+    return get_metrics().snapshot()
 
 
 def _serialize_document(document: dict) -> dict:
@@ -193,9 +306,7 @@ def delete_document(document_id: str) -> dict[str, str]:
         logger.warning("Delete failed. Document not found for id: %s", document_id)
         raise HTTPException(status_code=404, detail="Documento no encontrado.")
 
-    return {
-        "status": "deleted",
-    }
+    return {"status": "deleted"}
 
 
 @app.get("/documents/{document_id}/download")
@@ -276,11 +387,18 @@ async def upload_pdf(file: UploadFile = File(...)) -> dict[str, str | int]:
     except InvalidPDFError as exc:
         logger.warning("Invalid PDF content for filename=%s: %s", filename, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ExtractServiceBusyError as exc:
+    except (ExtractServiceBusyError, CircuitBreakerOpenError, BulkheadFullError) as exc:
         logger.warning("Upload rejected: servicio de extracción saturado. filename=%s", filename)
         raise HTTPException(
             status_code=503,
             detail=SERVICE_BUSY_ERROR_DETAIL,
+            headers={"Retry-After": exc.retry_after},
+        ) from exc
+    except DocumentProcessingInProgressError as exc:
+        logger.warning("Upload en curso para filename=%s", filename)
+        raise HTTPException(
+            status_code=409,
+            detail=DOCUMENT_IN_PROGRESS_ERROR_DETAIL,
             headers={"Retry-After": exc.retry_after},
         ) from exc
     except ExtractServiceTimeoutError as exc:
@@ -289,6 +407,9 @@ async def upload_pdf(file: UploadFile = File(...)) -> dict[str, str | int]:
     except ExtractServiceUnavailableError as exc:
         logger.error("Upload failed: servicio de extracción caído. filename=%s", filename)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except DocumentNotFoundError as exc:
+        logger.error("Upload failed: documento no encontrado. filename=%s", filename)
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     logger.info(
         "Upload processed successfully: filename=%s document_id=%s size_bytes=%d",

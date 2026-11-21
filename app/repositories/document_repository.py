@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from typing import Any, cast
 
 from bson.objectid import ObjectId
 from pymongo import MongoClient, ReturnDocument
@@ -16,7 +17,10 @@ class DocumentRepository:
     def __init__(self, mongo_client: MongoClient | None = None, settings: Settings | None = None):
         settings = settings or get_settings()
         if mongo_client is None:
-            mongo_client = MongoClient(settings.mongodb_uri)
+            mongo_client = MongoClient(
+                settings.mongodb_uri,
+                serverSelectionTimeoutMS=settings.mongodb_server_selection_timeout_ms,
+            )
 
         self.client = mongo_client
         self.db = mongo_client[settings.mongodb_db_name]
@@ -35,6 +39,7 @@ class DocumentRepository:
             partialFilterExpression={"deleted_at": {"$type": "null"}},
         )
         self.collection.create_index([("created_at", -1), ("_id", -1)])
+        self.collection.create_index([("estado", 1), ("saga.locked_at", 1), ("created_at", 1)])
         logger.info("Indexes ensured on collection=%s", self.collection.name)
 
     def save_document(self, document: dict) -> ObjectId:
@@ -86,10 +91,7 @@ class DocumentRepository:
         include_deleted: bool = False,
     ) -> list[dict]:
         logger.debug(
-            "Listing documents: skip=%d limit=%d include_text=%s",
-            skip,
-            limit,
-            include_text,
+            "Listing documents: skip=%d limit=%d include_text=%s", skip, limit, include_text
         )
         query = {} if include_deleted else self._not_deleted_filter()
         projection = None if include_text else {"txt_contenido": 0}
@@ -98,9 +100,25 @@ class DocumentRepository:
         cursor = cursor.sort([("created_at", -1), ("_id", -1)]).skip(skip).limit(limit)
         return list(cursor)
 
-    def update_document(self, document_id: ObjectId, updates: dict) -> dict | None:
-        logger.debug("Updating document id=%s fields=%s", document_id, list(updates.keys()))
-        query = self._apply_not_deleted_filter({"_id": document_id}, include_deleted=False)
+    def update_document(
+        self,
+        document_id: ObjectId,
+        updates: dict,
+        *,
+        expected_estado: str | None = None,
+    ) -> dict | None:
+        """Actualiza el documento. Si se indica ``expected_estado``, la
+        condición forman parte del filtro atómico (evita TOCTOU)."""
+        logger.debug(
+            "Updating document id=%s fields=%s expected_estado=%s",
+            document_id,
+            list(updates.keys()),
+            expected_estado,
+        )
+        base_query: dict[str, Any] = {"_id": document_id}
+        if expected_estado is not None:
+            base_query["estado"] = expected_estado
+        query = self._apply_not_deleted_filter(base_query, include_deleted=False)
         return self.collection.find_one_and_update(
             query,
             {"$set": updates},
@@ -117,6 +135,166 @@ class DocumentRepository:
             return_document=ReturnDocument.AFTER,
         )
         return result is not None
+
+    # ------------------------------------------------------------------
+    # Operaciones de la saga de upload
+    # ------------------------------------------------------------------
+
+    def _unlocked_or_stale_clause(self, now: datetime, lock_ttl_s: int) -> dict:
+        cutoff = now - timedelta(seconds=lock_ttl_s)
+        return {
+            "$or": [
+                {"saga.locked_at": None},
+                {"saga.locked_at": {"$exists": False}},
+                {"saga.locked_at": {"$lt": cutoff}},
+            ]
+        }
+
+    def claim_pending(
+        self,
+        document_id: Any,
+        *,
+        owner: str,
+        now: datetime,
+        lock_ttl_s: int,
+    ) -> dict | None:
+        """Toma posesión atómica de una saga pendiente.
+
+        Devuelve ``None`` si otro worker ya la está procesando o si el
+        documento dejó de estar pendiente.
+        """
+        query = {
+            "$and": [
+                {"_id": document_id},
+                {"estado": "pendiente"},
+                self._unlocked_or_stale_clause(now, lock_ttl_s),
+                self._not_deleted_filter(),
+            ]
+        }
+        result = self.collection.find_one_and_update(
+            query,
+            {
+                "$set": {
+                    "saga.locked_at": now,
+                    "saga.owner": owner,
+                    "saga.updated_at": now,
+                    "saga.last_error": None,
+                },
+                "$inc": {"saga.attempts": 1},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if result is not None:
+            logger.info("Saga claimed: document_id=%s owner=%s", document_id, owner)
+        return cast(dict | None, result)
+
+    def requeue_failed(
+        self,
+        document_id: Any,
+        *,
+        owner: str,
+        now: datetime,
+        lock_ttl_s: int,
+    ) -> dict | None:
+        """Reintenta un documento en error (compensación previa)."""
+        query = {
+            "$and": [
+                {"_id": document_id},
+                {"estado": "error"},
+                self._unlocked_or_stale_clause(now, lock_ttl_s),
+                self._not_deleted_filter(),
+            ]
+        }
+        return cast(
+            dict | None,
+            self.collection.find_one_and_update(
+                query,
+                {
+                    "$set": {
+                        "estado": "pendiente",
+                        "error": None,
+                        "saga.locked_at": now,
+                        "saga.owner": owner,
+                        "saga.updated_at": now,
+                        "saga.last_error": None,
+                    },
+                    "$inc": {"saga.attempts": 1},
+                },
+                return_document=ReturnDocument.AFTER,
+            ),
+        )
+
+    def complete_saga(
+        self,
+        document_id: Any,
+        *,
+        texto: str,
+        duracion_ms: int,
+        now: datetime,
+    ) -> dict | None:
+        logger.info("Completing saga for document_id=%s", document_id)
+        return self.collection.find_one_and_update(
+            self._apply_not_deleted_filter({"_id": document_id}, include_deleted=False),
+            {
+                "$set": {
+                    "estado": "ok",
+                    "txt_contenido": texto,
+                    "txt_chars": len(texto),
+                    "duracion_ms": duracion_ms,
+                    "error": None,
+                    "saga.locked_at": None,
+                    "saga.owner": None,
+                    "saga.finished_at": now,
+                    "saga.updated_at": now,
+                    "saga.last_error": None,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def compensate_saga(
+        self,
+        document_id: Any,
+        *,
+        error: Exception | str,
+        now: datetime,
+    ) -> dict | None:
+        detail = str(error)[:500]
+        logger.warning("Compensating saga for document_id=%s: %s", document_id, detail)
+        return self.collection.find_one_and_update(
+            self._apply_not_deleted_filter({"_id": document_id}, include_deleted=False),
+            {
+                "$set": {
+                    "estado": "error",
+                    "error": detail,
+                    "txt_contenido": "",
+                    "txt_chars": 0,
+                    "saga.locked_at": None,
+                    "saga.owner": None,
+                    "saga.last_error": detail,
+                    "saga.failed_at": now,
+                    "saga.updated_at": now,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def find_resumable_pending(
+        self,
+        *,
+        now: datetime,
+        lock_ttl_s: int,
+        limit: int,
+    ) -> list[dict]:
+        query = {
+            "$and": [
+                {"estado": "pendiente"},
+                self._unlocked_or_stale_clause(now, lock_ttl_s),
+                self._not_deleted_filter(),
+            ]
+        }
+        cursor = self.collection.find(query).sort([("created_at", 1)]).limit(limit)
+        return list(cursor)
 
 
 @lru_cache(maxsize=1)

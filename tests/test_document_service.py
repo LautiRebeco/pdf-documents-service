@@ -27,7 +27,9 @@ def test_update_document_allows_pendiente_to_ok() -> None:
     result = service.update_document(doc_id, {"estado": "ok"})
 
     assert result["estado"] == "ok"
-    repository.update_document.assert_called_once_with(doc_id, {"estado": "ok"})
+    repository.update_document.assert_called_once_with(
+        doc_id, {"estado": "ok"}, expected_estado="pendiente"
+    )
 
 
 def test_update_document_allows_pendiente_to_error() -> None:
@@ -40,7 +42,9 @@ def test_update_document_allows_pendiente_to_error() -> None:
     result = service.update_document(doc_id, {"estado": "error"})
 
     assert result["estado"] == "error"
-    repository.update_document.assert_called_once_with(doc_id, {"estado": "error"})
+    repository.update_document.assert_called_once_with(
+        doc_id, {"estado": "error"}, expected_estado="pendiente"
+    )
 
 
 def test_update_document_allows_error_to_pendiente() -> None:
@@ -53,7 +57,9 @@ def test_update_document_allows_error_to_pendiente() -> None:
     result = service.update_document(doc_id, {"estado": "pendiente"})
 
     assert result["estado"] == "pendiente"
-    repository.update_document.assert_called_once_with(doc_id, {"estado": "pendiente"})
+    repository.update_document.assert_called_once_with(
+        doc_id, {"estado": "pendiente"}, expected_estado="error"
+    )
 
 
 def test_update_document_rejects_error_to_ok() -> None:

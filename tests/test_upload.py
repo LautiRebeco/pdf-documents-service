@@ -93,7 +93,7 @@ def test_upload_pdf_rejects_invalid_pdf_content(monkeypatch, empty_repository) -
 
     assert response.status_code == 400
     assert response.json() == {"detail": detail}
-    empty_repository.save_document.assert_not_called()
+    empty_repository.compensate_saga.assert_called_once()
 
 
 def test_upload_pdf_returns_503_when_extract_service_is_busy(
@@ -108,7 +108,7 @@ def test_upload_pdf_returns_503_when_extract_service_is_busy(
     assert response.status_code == 503
     assert response.headers["retry-after"] == "2"
     assert response.json() == {"detail": main_module.SERVICE_BUSY_ERROR_DETAIL}
-    empty_repository.save_document.assert_not_called()
+    empty_repository.compensate_saga.assert_called_once()
 
 
 def test_upload_pdf_returns_504_when_extract_service_times_out(
@@ -137,7 +137,7 @@ def test_upload_pdf_returns_502_when_extract_service_is_down(
 
     assert response.status_code == 502
     assert response.json() == {"detail": "caído"}
-    empty_repository.save_document.assert_not_called()
+    empty_repository.compensate_saga.assert_called_once()
 
 
 def test_upload_pdf_does_not_call_extract_service_for_duplicates(monkeypatch, pdf_bytes) -> None:

@@ -33,7 +33,7 @@ def test_process_pdf_upload_orchestrates_checksum_builder_and_repository(
             "txt_chars": len(kwargs["texto_extraido"]),
             "checksum_archivo": kwargs["checksum_archivo"],
             "checksum_algoritmo": "sha256",
-            "estado": "ok",
+            "estado": kwargs["estado"],
             "error": None,
             "created_at": "now",
             "duracion_ms": kwargs["duracion_ms"],
@@ -49,11 +49,19 @@ def test_process_pdf_upload_orchestrates_checksum_builder_and_repository(
     )
 
     assert captured_builder_args["pdf_nombre"] == file_name
-    assert captured_builder_args["texto_extraido"] == "texto extraido"
+    # La saga reserva el documento en pendiente antes de extraer el texto.
+    assert captured_builder_args["estado"] == "pendiente"
+    assert captured_builder_args["texto_extraido"] == ""
     assert captured_builder_args["checksum_archivo"] == "checksum123"
     assert isinstance(captured_builder_args["duracion_ms"], int)
-    repository.save_document.assert_called_once_with(result["document"])
+
+    saved_document = repository.save_document.call_args.args[0]
+    assert saved_document["estado"] == "pendiente"
+    assert saved_document["saga"]["attempts"] == 1
+    repository.complete_saga.assert_called_once()
+
     assert result["document"]["txt_contenido"] == "texto extraido"
+    assert result["document"]["estado"] == "ok"
     assert result["document_id"] == "507f1f77bcf86cd799439011"
 
 
@@ -110,7 +118,7 @@ def test_process_pdf_upload_uses_extract_client_by_default(monkeypatch) -> None:
     assert result["document"]["txt_contenido"] == "texto remoto"
 
 
-def test_process_pdf_upload_does_not_save_when_extraction_fails() -> None:
+def test_process_pdf_upload_compensates_when_extraction_fails() -> None:
     repository = MagicMock()
     repository.find_by_checksum.return_value = None
 
@@ -122,7 +130,10 @@ def test_process_pdf_upload_does_not_save_when_extraction_fails() -> None:
             file_name="a.pdf", file_bytes=b"basura", repository=repository, extractor=invalid_pdf
         )
 
-    repository.save_document.assert_not_called()
+    # La reserva se persiste, pero la compensación deja la saga en error.
+    repository.save_document.assert_called_once()
+    repository.compensate_saga.assert_called_once()
+    repository.complete_saga.assert_not_called()
 
 
 def test_process_pdf_upload_uses_shared_repository_by_default(monkeypatch) -> None:

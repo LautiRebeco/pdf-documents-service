@@ -290,7 +290,7 @@ def test_repository_creates_mongo_client_with_uri_from_settings(monkeypatch) -> 
 
     DocumentRepository(settings=Settings(mongodb_uri="mongodb://db:27017"))
 
-    mongo_client_class.assert_called_once_with("mongodb://db:27017")
+    mongo_client_class.assert_called_once_with("mongodb://db:27017", serverSelectionTimeoutMS=2_000)
 
 
 def test_get_document_repository_reuses_a_single_mongo_client(monkeypatch) -> None:
