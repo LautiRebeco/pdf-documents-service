@@ -4,4 +4,9 @@
 *.py[cod]
 .venv/
 .env
+.env.*
+!.env.example
 tests/
+.git/
+.github/
+*.md

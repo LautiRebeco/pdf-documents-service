@@ -5,11 +5,14 @@ from functools import lru_cache
 
 import httpx
 
+from app.security import safe_retry_after, sanitize_text
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
 EXTRACT_TEXT_PATH = "/extract/text"
+MAX_EXTRACTED_TEXT_CHARS = 5_000_000
+UPSTREAM_ERROR_MAX_CHARS = 200
 
 
 class InvalidPDFError(ValueError):
@@ -23,7 +26,8 @@ class ExtractServiceError(RuntimeError):
 class ExtractServiceBusyError(ExtractServiceError):
     def __init__(self, retry_after: str) -> None:
         super().__init__("Servicio de extracción saturado.")
-        self.retry_after = retry_after
+        # El valor viene de un servicio externo: nunca se propaga crudo.
+        self.retry_after = safe_retry_after(retry_after)
 
 
 class ExtractServiceUnavailableError(ExtractServiceError):
@@ -54,9 +58,10 @@ def close_extract_client() -> None:
 
 def _error_detail(response: httpx.Response) -> str:
     try:
-        return str(response.json()["detail"])
+        detail = str(response.json()["detail"])
     except Exception:
-        return response.text
+        detail = response.text
+    return sanitize_text(detail, UPSTREAM_ERROR_MAX_CHARS)
 
 
 def extract_text(file_bytes: bytes, *, client: httpx.Client | None = None) -> str:
@@ -91,11 +96,20 @@ def extract_text(file_bytes: bytes, *, client: httpx.Client | None = None) -> st
         logger.error(
             "Extract service failed: status_code=%d response=%s",
             response.status_code,
-            response.text,
+            sanitize_text(response.text, UPSTREAM_ERROR_MAX_CHARS),
         )
         raise ExtractServiceUnavailableError(
             f"El servicio de extracción respondió {response.status_code}."
         )
 
-    content: str = response.json()["content"]
+    try:
+        payload = response.json()
+        content = payload["content"] if isinstance(payload, dict) else None
+    except TypeError, ValueError:
+        content = None
+    if not isinstance(content, str) or len(content) > MAX_EXTRACTED_TEXT_CHARS:
+        logger.error("Extract service returned an invalid or oversized payload")
+        raise ExtractServiceUnavailableError(
+            "El servicio de extracción devolvió una respuesta inválida."
+        )
     return content

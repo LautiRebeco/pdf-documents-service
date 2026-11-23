@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -20,6 +19,8 @@ DEFAULT_EXTRACT_MAX_ATTEMPTS = 3
 DEFAULT_EXTRACT_MAX_CONCURRENCY = 20
 DEFAULT_SAGA_LOCK_TTL_S = 120
 DEFAULT_SAGA_RECOVERY_INTERVAL_S = 60
+MAX_LIST_LIMIT_CEILING = 100
+DEFAULT_RATE_LIMIT_PER_MINUTE = 0
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -91,11 +92,14 @@ def _choice_env(name: str, default: str, choices: set[str]) -> str:
 class Settings:
     app_name: str = "PDF Extractext Documents"
     max_pdf_size_bytes: int = DEFAULT_MAX_PDF_SIZE_BYTES
-    max_list_limit: int = 100
-    upload_spool_max_bytes: int = sys.maxsize
+    max_list_limit: int = MAX_LIST_LIMIT_CEILING
+    upload_spool_max_bytes: int = DEFAULT_MAX_PDF_SIZE_BYTES
     log_level: str = DEFAULT_LOG_LEVEL
     log_format: str = DEFAULT_LOG_FORMAT
     shutdown_timeout_s: float = 10.0
+    api_key: str = field(default="", repr=False)
+    rate_limit_per_minute: int = DEFAULT_RATE_LIMIT_PER_MINUTE
+    docs_enabled: bool = False
 
     mongodb_uri: str = field(default="mongodb://localhost:27017", repr=False)
     mongodb_db_name: str = "pdf-extractext"
@@ -126,14 +130,30 @@ class Settings:
 def get_settings() -> Settings:
     logger.debug("Loading application settings from environment")
 
+    max_pdf_size_bytes = _positive_int_env("APP_MAX_PDF_SIZE_BYTES", DEFAULT_MAX_PDF_SIZE_BYTES)
+    # El spool nunca debe superar el tamaño máximo: evita que un upload gigante
+    # se quede completamente en RAM antes de ser rechazado.
+    upload_spool_max_bytes = min(
+        _positive_int_env("APP_UPLOAD_SPOOL_MAX_BYTES", max_pdf_size_bytes),
+        max_pdf_size_bytes,
+    )
+
     return Settings(
         app_name=os.getenv("APP_NAME", "PDF Extractext Documents"),
-        max_pdf_size_bytes=_positive_int_env("APP_MAX_PDF_SIZE_BYTES", DEFAULT_MAX_PDF_SIZE_BYTES),
-        max_list_limit=_positive_int_env("APP_MAX_LIST_LIMIT", 100),
-        upload_spool_max_bytes=_positive_int_env("APP_UPLOAD_SPOOL_MAX_BYTES", sys.maxsize),
+        max_pdf_size_bytes=max_pdf_size_bytes,
+        max_list_limit=min(
+            _positive_int_env("APP_MAX_LIST_LIMIT", MAX_LIST_LIMIT_CEILING),
+            MAX_LIST_LIMIT_CEILING,
+        ),
+        upload_spool_max_bytes=upload_spool_max_bytes,
         log_level=_log_level_env("APP_LOG_LEVEL", DEFAULT_LOG_LEVEL),
         log_format=_choice_env("APP_LOG_FORMAT", DEFAULT_LOG_FORMAT, {"json", "text"}),
         shutdown_timeout_s=_positive_float_env("APP_SHUTDOWN_TIMEOUT_S", 10.0),
+        api_key=os.getenv("APP_API_KEY", ""),
+        rate_limit_per_minute=_positive_int_env(
+            "APP_RATE_LIMIT_PER_MINUTE", DEFAULT_RATE_LIMIT_PER_MINUTE
+        ),
+        docs_enabled=os.getenv("APP_DOCS_ENABLED", "false").lower() in {"1", "true", "yes"},
         mongodb_uri=os.getenv("MONGODB_URI", "mongodb://localhost:27017"),
         mongodb_db_name=os.getenv("MONGODB_DB_NAME", "pdf-extractext"),
         mongodb_collection_name=os.getenv("MONGO_COLLECTION_NAME", "documents"),

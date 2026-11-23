@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import datetime
@@ -10,6 +11,7 @@ from bson.objectid import ObjectId
 
 from app.cache.backends import CacheBackend, InMemoryCache, RedisCache
 from app.resilience.metrics import Metrics, get_metrics
+from app.security import valid_checksum
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -79,7 +81,12 @@ def document_suffix(document_id: str, include_text: bool) -> str:
 
 
 def checksum_suffix(checksum: str) -> str:
-    return f"checksum:{checksum}"
+    # Entrada controlada por el cliente: si no es un checksum válido se deriva
+    # una clave opaca para no permitir colisiones ni inyección de namespace.
+    if valid_checksum(checksum):
+        return f"checksum:{checksum}"
+    digest = hashlib.sha256(checksum.encode("utf-8")).hexdigest()
+    return f"checksum:invalid:{digest}"
 
 
 def list_suffix(skip: int, limit: int, include_text: bool) -> str:

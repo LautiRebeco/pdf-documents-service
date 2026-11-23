@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import threading
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Literal
 
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
@@ -25,6 +28,14 @@ from app.repositories.document_repository import (
 )
 from app.resilience.errors import BulkheadFullError, CircuitBreakerOpenError
 from app.resilience.metrics import get_metrics
+from app.security import (
+    require_api_key,
+    safe_filename,
+    safe_retry_after,
+    sanitize_text,
+    valid_checksum,
+    valid_request_id,
+)
 from app.services.document_service import DocumentService, InvalidStatusTransitionError
 from app.services.extract_client import (
     ExtractServiceBusyError,
@@ -42,7 +53,10 @@ from app.services.upload_service import (
 )
 from app.settings import get_settings
 
-load_dotenv()
+# En contenedores/producción las variables las inyecta el orquestador; un .env
+# local no debe poder redirigir EXTRACT_SERVICE_URL ni las URIs de los clientes.
+if os.getenv("APP_DISABLE_DOTENV", "").lower() not in {"1", "true", "yes"}:
+    load_dotenv(override=False)
 
 EMPTY_FILE_ERROR_DETAIL = "El archivo está vacio."
 MAX_FILE_SIZE_ERROR_TEMPLATE = "El archivo supera el tamaño máximo permitido de {max_size} bytes."
@@ -51,13 +65,40 @@ INVALID_DOCUMENT_ID_ERROR_DETAIL = "ID de documento inválido."
 NO_UPDATE_FIELDS_ERROR_DETAIL = "No hay campos para actualizar."
 SERVICE_BUSY_ERROR_DETAIL = "Servicio saturado, reintentá en unos segundos."
 DOCUMENT_IN_PROGRESS_ERROR_DETAIL = "El documento ya está siendo procesado, reintentá."
+TOO_MANY_REQUESTS_ERROR_DETAIL = "Demasiadas solicitudes, reintentá en unos segundos."
+INVALID_CHECKSUM_ERROR_DETAIL = "Checksum inválido."
+MULTIPART_BODY_OVERHEAD = 64 * 1024
+RATE_LIMIT_WINDOW_S = 60.0
+RATE_LIMIT_MAX_KEYS = 5_000
 
 settings = get_settings()
 configure_logging(settings.log_level, settings.log_format)
 logger = logging.getLogger(__name__)
 logger.info("Settings loaded: %s", settings)
+if not settings.api_key:
+    logger.warning(
+        "APP_API_KEY no configurada: la API queda sin autenticación a nivel de aplicación"
+    )
 MultiPartParser.spool_max_size = settings.upload_spool_max_bytes
 MAX_LIST_LIMIT = settings.max_list_limit
+
+_rate_buckets: dict[str, deque[float]] = {}
+_rate_lock = threading.Lock()
+
+
+def _is_rate_limited(key: str, limit: int) -> bool:
+    now = monotonic()
+    with _rate_lock:
+        if len(_rate_buckets) > RATE_LIMIT_MAX_KEYS:
+            for old_key in [k for k, v in _rate_buckets.items() if not v]:
+                _rate_buckets.pop(old_key, None)
+        bucket = _rate_buckets.setdefault(key, deque())
+        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_S:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            return True
+        bucket.append(now)
+        return False
 
 
 @asynccontextmanager
@@ -88,21 +129,68 @@ async def lifespan(_app: FastAPI):
         close_document_cache()
 
 
-app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
+_docs_url = "/docs" if settings.docs_enabled else None
+_redoc_url = "/redoc" if settings.docs_enabled else None
+_openapi_url = "/openapi.json" if settings.docs_enabled else None
+
+app = FastAPI(
+    title=settings.app_name,
+    version=__version__,
+    lifespan=lifespan,
+    docs_url=_docs_url,
+    redoc_url=_redoc_url,
+    openapi_url=_openapi_url,
+)
 
 
 @app.middleware("http")
 async def request_context(request: Request, call_next):
-    request_id = (
-        request.headers.get("x-request-id")
-        or request.headers.get("x-correlation-id")
-        or uuid.uuid4().hex
+    supplied_id = (
+        request.headers.get("x-request-id") or request.headers.get("x-correlation-id") or ""
     )
+    request_id = supplied_id if supplied_id and valid_request_id(supplied_id) else uuid.uuid4().hex
     token = bind_request_id(request_id)
     started_at = perf_counter()
     response: Response | None = None
 
+    def finish(candidate: Response) -> Response:
+        candidate.headers["X-Request-ID"] = request_id
+        return candidate
+
     try:
+        # Rechazo temprano por tamaño declarado: evita que Starlette spoolée un
+        # cuerpo gigante antes de que el endpoint pueda validarlo.
+        if request.url.path == "/documents/upload" and request.method == "POST":
+            declared = request.headers.get("content-length")
+            if declared is not None:
+                try:
+                    too_large = (
+                        int(declared) > settings.max_pdf_size_bytes + MULTIPART_BODY_OVERHEAD
+                    )
+                except ValueError:
+                    too_large = False
+                if too_large:
+                    response = JSONResponse(
+                        status_code=413,
+                        content={
+                            "detail": MAX_FILE_SIZE_ERROR_TEMPLATE.format(
+                                max_size=settings.max_pdf_size_bytes
+                            )
+                        },
+                    )
+                    return finish(response)
+
+        limit = settings.rate_limit_per_minute
+        client_ip = request.client.host if request.client else "unknown"
+        if limit and request.url.path.startswith("/documents"):
+            if _is_rate_limited(f"{client_ip}:{request.url.path.split('/')[1]}", limit):
+                response = JSONResponse(
+                    status_code=429,
+                    content={"detail": TOO_MANY_REQUESTS_ERROR_DETAIL},
+                    headers={"Retry-After": str(int(RATE_LIMIT_WINDOW_S))},
+                )
+                return finish(response)
+
         response = await call_next(request)
     except Exception:
         logger.exception(
@@ -129,8 +217,7 @@ async def request_context(request: Request, call_next):
         clear_request_id(token)
 
     assert response is not None
-    response.headers["X-Request-ID"] = request_id
-    return response
+    return finish(response)
 
 
 class DocumentUpdate(BaseModel):
@@ -158,8 +245,8 @@ def readiness() -> JSONResponse:
     try:
         get_document_repository().client.admin.command("ping")
         checks["mongodb"] = "ok"
-    except Exception as exc:
-        checks["mongodb"] = f"unavailable: {type(exc).__name__}"
+    except Exception:
+        checks["mongodb"] = "unavailable"
         ready = False
 
     breaker_state = get_extract_breaker().state.value
@@ -176,13 +263,33 @@ def readiness() -> JSONResponse:
     )
 
 
-@app.get("/metrics")
+@app.get("/metrics", dependencies=[Depends(require_api_key)])
 def metrics() -> dict[str, float]:
     return get_metrics().snapshot()
 
 
+# Whitelist: nunca exponer `saga.owner` (hostname/PID), locks ni `saga.last_error`.
+_PUBLIC_DOCUMENT_FIELDS = frozenset(
+    {
+        "_id",
+        "pdf_nombre",
+        "txt_contenido",
+        "txt_chars",
+        "checksum_archivo",
+        "checksum_algoritmo",
+        "estado",
+        "error",
+        "created_at",
+        "deleted_at",
+        "duracion_ms",
+    }
+)
+
+
 def _serialize_document(document: dict) -> dict:
-    document_copy = {**document}
+    document_copy = {
+        key: value for key, value in document.items() if key in _PUBLIC_DOCUMENT_FIELDS
+    }
     document_id = document_copy.get("_id")
     if document_id is not None:
         document_copy["_id"] = str(document_id)
@@ -211,8 +318,10 @@ def _parse_document_id(document_id: str) -> ObjectId:
         raise HTTPException(status_code=400, detail=INVALID_DOCUMENT_ID_ERROR_DETAIL) from exc
 
 
-@app.get("/documents/by-checksum/{checksum}")
+@app.get("/documents/by-checksum/{checksum}", dependencies=[Depends(require_api_key)])
 def get_document_by_checksum(checksum: str) -> dict[str, object]:
+    if not valid_checksum(checksum):
+        raise HTTPException(status_code=400, detail=INVALID_CHECKSUM_ERROR_DETAIL)
     logger.info("Requested document by checksum: %s", checksum)
     service = DocumentService()
     document = service.get_document_by_checksum(checksum)
@@ -228,7 +337,7 @@ def get_document_by_checksum(checksum: str) -> dict[str, object]:
     }
 
 
-@app.get("/documents")
+@app.get("/documents", dependencies=[Depends(require_api_key)])
 def list_documents(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=MAX_LIST_LIMIT),
@@ -247,7 +356,7 @@ def list_documents(
     }
 
 
-@app.get("/documents/{document_id}")
+@app.get("/documents/{document_id}", dependencies=[Depends(require_api_key)])
 def get_document_by_id(document_id: str, include_text: bool = True) -> dict[str, object]:
     logger.info("Requested document by id: %s", document_id)
     object_id = _parse_document_id(document_id)
@@ -264,7 +373,7 @@ def get_document_by_id(document_id: str, include_text: bool = True) -> dict[str,
     }
 
 
-@app.patch("/documents/{document_id}")
+@app.patch("/documents/{document_id}", dependencies=[Depends(require_api_key)])
 def update_document(document_id: str, payload: DocumentUpdate) -> dict[str, object]:
     logger.info("Updating document id: %s", document_id)
     object_id = _parse_document_id(document_id)
@@ -295,7 +404,7 @@ def update_document(document_id: str, payload: DocumentUpdate) -> dict[str, obje
     }
 
 
-@app.delete("/documents/{document_id}")
+@app.delete("/documents/{document_id}", dependencies=[Depends(require_api_key)])
 def delete_document(document_id: str) -> dict[str, str]:
     logger.info("Deleting document id: %s", document_id)
     object_id = _parse_document_id(document_id)
@@ -309,7 +418,7 @@ def delete_document(document_id: str) -> dict[str, str]:
     return {"status": "deleted"}
 
 
-@app.get("/documents/{document_id}/download")
+@app.get("/documents/{document_id}/download", dependencies=[Depends(require_api_key)])
 def download_document_text(document_id: str) -> Response:
     logger.info("Download requested for document_id: %s", document_id)
     object_id = _parse_document_id(document_id)
@@ -322,7 +431,7 @@ def download_document_text(document_id: str) -> Response:
         raise HTTPException(status_code=404, detail="Documento no encontrado.")
 
     txt_content = document.get("txt_contenido", "")
-    downloaded_filename = f"{document.get('pdf_nombre', 'documento')}.txt"
+    downloaded_filename = f"{safe_filename(str(document.get('pdf_nombre', 'documento')))}.txt"
 
     logger.info(
         "Download processed successfully for document_id: %s, filename: %s",
@@ -339,6 +448,13 @@ def download_document_text(document_id: str) -> Response:
     )
 
 
+def _file_too_large_error() -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail=MAX_FILE_SIZE_ERROR_TEMPLATE.format(max_size=settings.max_pdf_size_bytes),
+    )
+
+
 def _ensure_valid_size(file_bytes: bytes, filename: str) -> None:
     if not file_bytes:
         logger.warning("Rejected PDF: archivo vacío. filename=%s", filename)
@@ -351,16 +467,31 @@ def _ensure_valid_size(file_bytes: bytes, filename: str) -> None:
             len(file_bytes),
             settings.max_pdf_size_bytes,
         )
-        raise HTTPException(
-            status_code=413,
-            detail=MAX_FILE_SIZE_ERROR_TEMPLATE.format(max_size=settings.max_pdf_size_bytes),
-        )
+        raise _file_too_large_error()
 
 
-@app.post("/documents/upload")
+async def _read_bounded_upload(file: UploadFile, filename: str) -> bytes:
+    """Lee por chunks y aborta en cuanto supera el límite (sin copia extra)."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(64 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > settings.max_pdf_size_bytes:
+            logger.warning(
+                "Rejected PDF while streaming: filename=%s size_bytes=%d", filename, total
+            )
+            raise _file_too_large_error()
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@app.post("/documents/upload", dependencies=[Depends(require_api_key)])
 async def upload_pdf(file: UploadFile = File(...)) -> dict[str, str | int]:
-    file_bytes = await file.read()
-    filename = file.filename or "sin_nombre.pdf"
+    filename = sanitize_text(file.filename or "sin_nombre.pdf", 200)
+    file_bytes = await _read_bounded_upload(file, filename)
     logger.info(
         "Upload request received: filename=%s content_type=%s size_bytes=%d",
         filename,
@@ -386,30 +517,30 @@ async def upload_pdf(file: UploadFile = File(...)) -> dict[str, str | int]:
         )
     except InvalidPDFError as exc:
         logger.warning("Invalid PDF content for filename=%s: %s", filename, exc)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=sanitize_text(exc)) from exc
     except (ExtractServiceBusyError, CircuitBreakerOpenError, BulkheadFullError) as exc:
         logger.warning("Upload rejected: servicio de extracción saturado. filename=%s", filename)
         raise HTTPException(
             status_code=503,
             detail=SERVICE_BUSY_ERROR_DETAIL,
-            headers={"Retry-After": exc.retry_after},
+            headers={"Retry-After": safe_retry_after(exc.retry_after)},
         ) from exc
     except DocumentProcessingInProgressError as exc:
         logger.warning("Upload en curso para filename=%s", filename)
         raise HTTPException(
             status_code=409,
             detail=DOCUMENT_IN_PROGRESS_ERROR_DETAIL,
-            headers={"Retry-After": exc.retry_after},
+            headers={"Retry-After": safe_retry_after(exc.retry_after)},
         ) from exc
     except ExtractServiceTimeoutError as exc:
         logger.error("Upload failed: extracción sin respuesta. filename=%s", filename)
-        raise HTTPException(status_code=504, detail=str(exc)) from exc
+        raise HTTPException(status_code=504, detail=sanitize_text(exc)) from exc
     except ExtractServiceUnavailableError as exc:
         logger.error("Upload failed: servicio de extracción caído. filename=%s", filename)
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=sanitize_text(exc)) from exc
     except DocumentNotFoundError as exc:
         logger.error("Upload failed: documento no encontrado. filename=%s", filename)
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=sanitize_text(exc)) from exc
 
     logger.info(
         "Upload processed successfully: filename=%s document_id=%s size_bytes=%d",

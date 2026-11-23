@@ -86,6 +86,14 @@ Todas las respuestas incluyen `X-Request-ID`. Si Traefik envía `X-Request-ID` o
 
 Códigos de error relevantes: `400` PDF inválido, `409` saga en curso, `503` extract saturado o breaker abierto, `504` timeout del extract, `502` extract caído.
 
+### Seguridad
+
+- **Autenticación**: si `APP_API_KEY` está configurada, todas las rutas `/documents` y `/metrics` exigen `X-API-Key` (o `Authorization: Bearer`) con comparación de tiempo constante. Las sondas `/health*` quedan abiertas para los healthchecks. **En producción la clave es obligatoria**; si está vacía la API funciona sin auth (sólo desarrollo local).
+- **Abuso**: `APP_RATE_LIMIT_PER_MINUTE` limiting por IP (recomendado `120`). El upload rechaza por `Content-Length`, lee por chunks con corte en `APP_MAX_PDF_SIZE_BYTES` y valida el magic bytes `%PDF-`; el spool nunca supera ese máximo.
+- **Exposición**: el serializer no devuelve `saga.*` (dueño/hostname/PID, errores internos). `/docs`, `/redoc` y `/openapi.json` están desactivados salvo `APP_DOCS_ENABLED=true`. `Retry-After` se acota a 1-30 s y los errores del extract se sanean antes de reenviarse o persistirse.
+- **Configuración**: en contenedores `APP_DISABLE_DOTENV=1` evita que un `.env` local redirija clientes. Usar `mongodb://...?tls=true`, `rediss://` y `https://` en producción; el compose de desarrollo publica Mongo/Redis sólo en loopback y con credenciales.
+- **Supply chain**: imágenes base e instalador fijados por digest, GitHub Actions fijadas por SHA, `pip-audit` como gate del workflow y publicación por digest inmutable.
+
 ---
 
 ## Desarrollo y despliegue
@@ -98,9 +106,11 @@ docker compose -f docker-compose.dev.yml up --build
 
 Copiar `.env.example` a `.env` y ajustar. En producción, el repo orquestador debe proveer:
 
-- `MONGODB_URI` (acceso exclusivo de este servicio).
-- `REDIS_URL` compartida por todas las réplicas.
-- `EXTRACT_SERVICE_URL` alcanzable desde la red de Traefik.
+- `MONGODB_URI` (acceso exclusivo de este servicio, con TLS y credenciales).
+- `REDIS_URL` compartida por todas las réplicas (`rediss://`).
+- `EXTRACT_SERVICE_URL` alcanzable desde la red de Traefik (HTTPS/mTLS).
+- `APP_API_KEY` secreta, inyectada también en Traefik para que el gateway y la app validen la misma credencial.
+- `APP_RATE_LIMIT_PER_MINUTE`, `APP_DISABLE_DOTENV=1` y `APP_DOCS_ENABLED=false`.
 - Rutas de healthcheck: `/health/live` (liveness) y `/health/ready` (readiness).
 - Reenvío/generación de `X-Request-ID` en Traefik para correlación extremo a extremo.
 

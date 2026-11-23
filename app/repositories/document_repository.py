@@ -8,6 +8,7 @@ from typing import Any, cast
 from bson.objectid import ObjectId
 from pymongo import MongoClient, ReturnDocument
 
+from app.security import sanitize_text
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -231,10 +232,15 @@ class DocumentRepository:
         texto: str,
         duracion_ms: int,
         now: datetime,
+        owner: str | None = None,
     ) -> dict | None:
         logger.info("Completing saga for document_id=%s", document_id)
+        query = self._apply_not_deleted_filter({"_id": document_id}, include_deleted=False)
+        if owner is not None:
+            # Fencing: el dueño original es el único que puede cerrar la saga.
+            query = {"$and": [query, {"saga.owner": owner}]}
         return self.collection.find_one_and_update(
-            self._apply_not_deleted_filter({"_id": document_id}, include_deleted=False),
+            query,
             {
                 "$set": {
                     "estado": "ok",
@@ -258,11 +264,15 @@ class DocumentRepository:
         *,
         error: Exception | str,
         now: datetime,
+        owner: str | None = None,
     ) -> dict | None:
-        detail = str(error)[:500]
+        detail = sanitize_text(error, 500)
         logger.warning("Compensating saga for document_id=%s: %s", document_id, detail)
+        query = self._apply_not_deleted_filter({"_id": document_id}, include_deleted=False)
+        if owner is not None:
+            query = {"$and": [query, {"saga.owner": owner}]}
         return self.collection.find_one_and_update(
-            self._apply_not_deleted_filter({"_id": document_id}, include_deleted=False),
+            query,
             {
                 "$set": {
                     "estado": "error",

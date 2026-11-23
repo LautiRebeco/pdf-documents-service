@@ -15,11 +15,14 @@ from app.repositories.document_repository import DocumentRepository, get_documen
 from app.resilience.metrics import get_metrics
 from app.services.checksum_service import calc_checksum
 from app.services.document_builder import construir_documento
-from app.services.extract_client import extract_text
+from app.services.extract_client import InvalidPDFError, extract_text
 from app.services.extract_resilience import extract_with_resilience
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+INVALID_PDF_DETAIL = "El contenido no corresponde a un PDF valido."
+PDF_MAGIC = b"%PDF-"
 
 
 class DocumentProcessingInProgressError(RuntimeError):
@@ -47,14 +50,19 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _compensate(repository: DocumentRepository, document_id: Any, error: Exception) -> None:
+def _compensate(
+    repository: DocumentRepository,
+    document_id: Any,
+    error: Exception,
+    owner: str | None = None,
+) -> None:
     """Compensación de la saga: deja el documento en ``error``.
 
     Nunca enmascara el error original: si la compensación falla, se registra y
     el proceso de recuperación volverá a intentarla.
     """
     try:
-        repository.compensate_saga(document_id, error=error, now=_now())
+        repository.compensate_saga(document_id, error=error, now=_now(), owner=owner)
         get_metrics().inc("saga.compensated")
         invalidate_document(document_id=str(document_id))
     except Exception as exc:  # pragma: no cover - defensive
@@ -193,11 +201,18 @@ def process_pdf_upload(
 
     document_id = document.get("_id")
 
+    # Validación de contenido antes de reenviar bytes a otro servicio del polyrepo.
+    # Se hace dentro de la saga para que la compensación siga siendo la misma.
+    if PDF_MAGIC not in file_bytes[:1024]:
+        invalid_pdf = InvalidPDFError(INVALID_PDF_DETAIL)
+        _compensate(active_repository, document_id, invalid_pdf, owner=owner)
+        raise invalid_pdf
+
     # Paso 2: extracción resiliente.
     try:
         texto_extraido = extract_with_resilience(file_bytes, extractor=active_extractor)
     except Exception as exc:
-        _compensate(active_repository, document_id, exc)
+        _compensate(active_repository, document_id, exc, owner=owner)
         raise
 
     duracion_ms = int((perf_counter() - started_at) * 1000)
@@ -210,14 +225,15 @@ def process_pdf_upload(
             texto=texto_extraido,
             duracion_ms=duracion_ms,
             now=_now(),
+            owner=owner,
         )
     except Exception as exc:
-        _compensate(active_repository, document_id, exc)
+        _compensate(active_repository, document_id, exc, owner=owner)
         raise
 
     if completed is None:
         error = DocumentNotFoundError("El documento desapareció durante la extracción.")
-        _compensate(active_repository, document_id, error)
+        _compensate(active_repository, document_id, error, owner=owner)
         raise error
 
     result_document = (
